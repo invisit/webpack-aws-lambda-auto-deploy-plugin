@@ -10,7 +10,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:watch": "yarn build -w",
-    "prepublishOnly": "yarn run lint && yarn run test && yarn run build",
     "test": "jest",
     "release": "yarn publish --non-interactive",
     "release:patch": "yarn release --patch"
