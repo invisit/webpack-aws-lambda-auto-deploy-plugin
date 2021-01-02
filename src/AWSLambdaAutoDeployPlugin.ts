@@ -219,6 +219,12 @@ export default class AWSLambdaAutoDeployPlugin<Storage extends AutoDeployStorage
     const allStats: Array<Webpack.Stats> = isMultiStats(statsOrMultiStats)
       ? statsOrMultiStats.stats
       : [statsOrMultiStats]
+    
+    if (allStats.some(it => it.hasErrors())) {
+      log.warn(`Build contains errors, skipping deploy`)
+      return
+    }
+    
     const pendingDeployments = uniq(
       allStats
         .map(({ compilation }) => [
