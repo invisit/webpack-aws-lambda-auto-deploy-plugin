@@ -1,371 +1,310 @@
-import http from 'http'
-import https from 'https'
-import fs from 'fs'
-import path from 'path'
-import ProgressBar from 'progress'
-import cdnizer from 'cdnizer'
-import _ from 'lodash'
-import mime from 'mime/lite'
-import {S3, CloudFront} from 'aws-sdk'
-
-import packageJson from '../package.json'
-
+import * as Path from "path"
+import { uniq } from "lodash"
+import * as AWS from "aws-sdk"
+import type { PackageJson } from "types-package-json"
+import Archiver from "archiver"
+import Webpack, { compilation } from "webpack"
+import * as Sh from "shelljs"
 import {
-  addSeperatorToPath,
-  addTrailingS3Sep,
-  getDirectoryFilesRecursive,
-  testRule,
-  UPLOAD_IGNORES,
-  DEFAULT_UPLOAD_OPTIONS,
-  REQUIRED_S3_UP_OPTS,
-  PATH_SEP,
-  DEFAULT_TRANSFORM,
-} from './helpers'
+  getFileTimestamp,
+  getLogger,
+  isMultiStats,
+  RootPluginDir
+} from "./helpers"
+import {
+  AWSDeployStorageConfig,
+  AWSLambdaAutoDeployPluginConfig,
+  DefaultEntryName,
+  EntryLambdaMapping
+} from "./types"
+import { asOption } from "@3fv/prelude-ts"
+import * as Fs from "fs"
+import moment from "moment"
+import { Deferred } from "@3fv/deferred"
 
-http.globalAgent.maxSockets = https.globalAgent.maxSockets = 50
+const log = getLogger()
 
-const compileError = (compilation, error) => {
-  compilation.errors.push(new Error(error))
+const compileError = (
+  compilation: Webpack.compilation.Compilation,
+  err: Error | string
+) => {
+  compilation.errors.push(err instanceof Error ? err : new Error(err))
 }
 
-module.exports = class S3Plugin {
-  constructor(options = {}) {
-    var {
-      include,
-      exclude,
-      progress,
-      basePath,
-      directory,
-      htmlFiles,
-      basePathTransform = DEFAULT_TRANSFORM,
-      s3Options = {},
-      cdnizerOptions = {},
-      s3UploadOptions = {},
-      cloudfrontInvalidateOptions = {},
-      priority,
-    } = options
+type AutoDeployArgs = [
+  Webpack.compilation.Compilation,
+  EntryLambdaMapping
+]
 
-    this.uploadOptions = s3UploadOptions
-    this.cloudfrontInvalidateOptions = cloudfrontInvalidateOptions
-    this.isConnected = false
-    this.cdnizerOptions = cdnizerOptions
-    this.urlMappings = []
-    this.uploadTotal = 0
-    this.uploadProgress = 0
-    this.basePathTransform = basePathTransform
-    basePath = basePath ? addTrailingS3Sep(basePath) : ''
+export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
+  readonly pkg: PackageJson = require(Path.join(RootPluginDir, "package.json"))
 
-    this.options = {
-      directory,
-      include,
-      exclude,
-      basePath,
-      priority,
-      htmlFiles: typeof htmlFiles === 'string' ? [htmlFiles] : htmlFiles,
-      progress: _.isBoolean(progress) ? progress : true,
-    }
+  readonly name: string = this.pkg.name
 
-    this.clientConfig = {
-      s3Options,
-      maxAsyncS3: 50,
-    }
-
-    this.noCdnizer = !Object.keys(this.cdnizerOptions).length
-
-    if (!this.noCdnizer && !this.cdnizerOptions.files)
-      this.cdnizerOptions.files = []
+  private readonly clients = {
+    s3: undefined,
+    lambda: undefined
+  } as {
+    s3: AWS.S3
+    lambda: AWS.Lambda
   }
 
-  apply(compiler) {
-    this.connect()
-
-    const isDirectoryUpload = !!this.options.directory,
-          hasRequiredUploadOpts = _.every(
-            REQUIRED_S3_UP_OPTS,
-            (type) => this.uploadOptions[type]
-          )
-
-    // Set directory to output dir or custom
-    this.options.directory =
-      this.options.directory ||
-      compiler.options.output.path ||
-      compiler.options.output.context ||
-      '.'
-
-    compiler.hooks.done.tapPromise(
-      packageJson.name,
-      async({compilation}) => {
-        let error
-
-        if (!hasRequiredUploadOpts)
-          error = `S3Plugin-RequiredS3UploadOpts: ${REQUIRED_S3_UP_OPTS.join(
-            ', '
-          )}`
-
-        if (error) return compileError(compilation, error)
-
-        if (isDirectoryUpload) {
-          const dPath = addSeperatorToPath(this.options.directory)
-
-          return this.getAllFilesRecursive(dPath)
-            .then((files) => this.handleFiles(files))
-            .catch((e) => this.handleErrors(e, compilation))
+  private async archive(
+    entry: string,
+    entryOutputPath: string,
+    entryFiles: string[]
+  ) {
+    const deferred = new Deferred<string>(),
+      handleDone = (event: string, outputFile: string) => {
+        log.trace(`Done (${event})`, outputFile)
+        if (!deferred.isSettled()) {
+          deferred.resolve(outputFile)
+        }
+      },
+      handleError = (err: Error) => {
+        log.error(`An error has occurred for entry (${entry})`, err)
+        if (!deferred.isSettled()) {
+          deferred.reject(err)
         } else {
-          return this.getAssetFiles(compilation)
-            .then((files) => this.handleFiles(files))
-            .catch((e) => this.handleErrors(e, compilation))
+          log.warn(
+            `Received another error, but this archive has already settled`,
+            err
+          )
         }
       }
+
+    try {
+      const outputDir = asOption(Sh.tempdir())
+          .tap(dir => {
+            Sh.mkdir("-p", dir)
+          })
+          .get(),
+        outputFile = Path.join(outputDir, `${entry}-${getFileTimestamp()}.zip`),
+        output = Fs.createWriteStream(outputFile),
+        archive = Archiver("zip", {})
+
+      output.on("close", function () {
+        log.info(`Bundle Complete (${outputFile}): ${archive.pointer()} bytes`)
+        handleDone("close", outputFile)
+      })
+
+      output.on("end", function () {
+        log.trace("Data has been drained")
+        handleDone("end", outputFile)
+      })
+
+      archive.on("warning", function (err) {
+        if (err.code === "ENOENT") {
+          log.warn(`code: ${err.code}`)
+        } else {
+          handleError(err)
+        }
+      })
+
+      archive.on("error", handleError)
+
+      archive.pipe(output)
+
+      entryFiles.forEach(file =>
+        asOption(file)
+          .tap(file => log.info(`${file} -> ${outputFile}`))
+          .tap(file =>
+            archive.file(file, {
+              name: Path.relative(entryOutputPath, file)
+            })
+          )
+      )
+
+      await archive.finalize()
+      handleDone("finalize", outputFile)
+    } catch (err) {
+      handleError(err)
+    }
+    return deferred.promise
+  }
+
+  /**
+   * Deploy the compilation to the configured
+   * entry <-> lambda mappings
+   *
+   * @param {webpack.compilation.Compilation} compilation
+   * @param {EntryLambdaMapping} entryMapping
+   * @returns {Promise<void>}
+   */
+  private deploy = async ([compilation, { entry, fn }]: AutoDeployArgs) => {
+    const entryOutputPath = compilation.outputOptions.path as string,
+      entryFiles = uniq(
+        Object.entries(compilation.assets).map(([name, out]) =>
+          asOption((<any>out).existsAt)
+            .orElse(() => asOption(Path.join(entryOutputPath, name)))
+            .filter(Fs.existsSync)
+            .getOrThrow("existsAt is not defined")
+        )
+      )
+
+    log.info(
+      `Deploying entry (${entry}) to functions ${fn.join(", ")}: `,
+      entryFiles
+    )
+
+    try {
+      const archiveFile = await this.archive(entry, entryOutputPath, entryFiles)
+      const { config } = this,
+        storageConfig =
+          config.aws?.storage ??
+          ({
+            type: "lambda"
+          } as AWSDeployStorageConfig<any>)
+
+      if (storageConfig.type === "s3") {
+        const s3StorageConfig = storageConfig as AWSDeployStorageConfig<"s3">
+        const { bucket, pathPrefix = "", namePrefix = "" } = s3StorageConfig
+
+        const path = pathPrefix.replace(/^\//, "").replace(/\/$/, ""),
+          isValidPath = path.length === 0,
+          key = `${isValidPath ? path + "/" : ""}${namePrefix}${entry}.zip`
+
+        await this.s3
+          .putObject({
+            Bucket: bucket,
+            Key: key,
+            ContentType: "application/zip",
+            Body: Fs.createReadStream(archiveFile)
+          })
+          .promise()
+
+        await Promise.all(
+          fn.map(async fn =>
+            this.lambda
+              .updateFunctionCode({
+                FunctionName: fn,
+                S3Bucket: bucket,
+                S3Key: key
+              })
+              .promise()
+          )
+        )
+      } else {
+        await Promise.all(
+          fn.map(async fn =>
+            this.lambda
+              .updateFunctionCode({
+                FunctionName: fn,
+                ZipFile: Fs.createReadStream(archiveFile)
+              })
+              .promise()
+          )
+        )
+      }
+    } catch (err) {
+      log.error(`Failed to deploy archive`, err)
+      throw err
+    }
+  }
+
+  /**
+   * Process done compilation event
+   *
+   * @param {webpack.Stats | webpack.compilation.MultiStats} statsOrMultiStats
+   * @returns {Promise<void>}
+   */
+  private onDone = async (
+    statsOrMultiStats: Webpack.Stats | Webpack.compilation.MultiStats
+  ) => {
+    const { entryMap } = this
+    const allStats: Array<Webpack.Stats> = isMultiStats(statsOrMultiStats)
+      ? statsOrMultiStats.stats
+      : [statsOrMultiStats]
+    const pendingDeployments = uniq(
+      allStats
+        .map(({ compilation }) => [
+          compilation,
+          entryMap[compilation.compiler?.name] ?? entryMap[DefaultEntryName]
+          // asOption()
+          //   .map(name => entryMap[name])
+          //   .getOrCall(() => Object.values(entryMap)[0])
+        ])
+        .filter(([, entry]) => Boolean(entry))
+    )
+
+    try {
+      await Promise.all(pendingDeployments.map(async (args:AutoDeployArgs) => {
+        const [compilation] = args
+        try {
+          await this.deploy(args)
+        } catch (err) {
+          compilation.errors.push(err)
+        }
+      }))
+    } catch (err) {
+      log.error(`AutoDeploy failed`, err)
+      throw err
+    }
+  }
+
+  // get namePrefix() {
+  //   return asOption(this.config)
+  //     .filter(config => config.)
+  // }
+
+  /**
+   * Entries that have configured functions
+   *
+   * @returns {string[]}
+   */
+  get entryNames() {
+    return Object.keys(this.entryMap)
+  }
+
+  get s3() {
+    return asOption(this.clients.s3).getOrCall(
+      () => (this.clients.s3 = new AWS.S3(this.awsConfig ?? {}))
     )
   }
 
-  handleFiles(files) {
-    return this.changeUrls(files)
-      .then((files) => this.filterAllowedFiles(files))
-      .then((files) => this.uploadFiles(files))
-      .then(() => this.invalidateCloudfront())
+  get lambda() {
+    return asOption(this.clients.lambda).getOrCall(
+      () => (this.clients.lambda = new AWS.Lambda(this.awsConfig ?? {}))
+    )
+  }
+
+  constructor(
+    public config: AWSLambdaAutoDeployPluginConfig,
+    public readonly awsConfig: Partial<AWS.Config> = config.aws?.config ?? {},
+    public readonly entryMap: Record<string, EntryLambdaMapping> = asOption(
+      config.mappings
+    )
+      .map(
+        it =>
+          (Array.isArray(it)
+            ? it
+            : [{ fn: it, entry: [DefaultEntryName] }]) as EntryLambdaMapping[]
+      )
+      .get()
+      .reduce(
+        (
+          map,
+          { fn, entry }: EntryLambdaMapping
+        ): Record<string, EntryLambdaMapping> => ({
+          ...map,
+          [entry]: {
+            entry,
+            fn: [
+              ...(map[entry]?.fn ?? []),
+              ...(typeof fn === "string" ? [fn] : fn)
+            ]
+          }
+        }),
+        {} as Record<string, EntryLambdaMapping>
+      )
+  ) {}
+
+  apply(compiler: Webpack.Compiler) {
+    compiler.hooks.done.tapPromise(this.name, this.onDone)
   }
 
   async handleErrors(error, compilation) {
-    compileError(compilation, `S3Plugin: ${error}`)
+    compileError(compilation, `AWSLambdaAutoDeployPlugin: ${error}`)
     throw error
-  }
-
-  getAllFilesRecursive(fPath) {
-    return getDirectoryFilesRecursive(fPath)
-  }
-
-  addPathToFiles(files, fPath) {
-    return files.map((file) => ({
-      name: file,
-      path: path.resolve(fPath, file),
-    }))
-  }
-
-  getFileName(file = '') {
-    if (_.includes(file, PATH_SEP))
-      return file.substring(_.lastIndexOf(file, PATH_SEP) + 1)
-    else return file
-  }
-
-  getAssetFiles({assets, outputOptions}) {
-    const files = _.map(assets, (value, name) => ({
-      name,
-      path: `${outputOptions.path}/${name}`,
-    }))
-
-    return Promise.resolve(files)
-  }
-
-  cdnizeHtml(file) {
-    return new Promise((resolve, reject) => {
-      fs.readFile(file.path, (err, data) => {
-        if (err) return reject(err)
-
-        fs.writeFile(file.path, this.cdnizer(data.toString()), (err) => {
-          if (err) return reject(err)
-
-          resolve(file)
-        })
-      })
-    })
-  }
-
-  changeUrls(files = []) {
-    if (this.noCdnizer) return Promise.resolve(files)
-
-    var allHtml
-
-    const {directory, htmlFiles = []} = this.options
-
-    if (htmlFiles.length)
-      allHtml = this.addPathToFiles(htmlFiles, directory).concat(files)
-    else allHtml = files
-
-    this.cdnizerOptions.files = allHtml.map(({name}) => `{/,}*${name}*`)
-    this.cdnizer = cdnizer(this.cdnizerOptions)
-
-    const [cdnizeFiles, otherFiles] = _(allHtml)
-      .uniq('name')
-      .partition((file) => /\.(html|css)/.test(file.name))
-      .value()
-
-    return Promise.all(
-      cdnizeFiles.map((file) => this.cdnizeHtml(file)).concat(otherFiles)
-    )
-  }
-
-  filterAllowedFiles(files) {
-    return files.reduce((res, file) => {
-      if (
-        this.isIncludeAndNotExclude(file.name) &&
-        !this.isIgnoredFile(file.name)
-      )
-        res.push(file)
-
-      return res
-    }, [])
-  }
-
-  isIgnoredFile(file) {
-    return _.some(UPLOAD_IGNORES, (ignore) => new RegExp(ignore).test(file))
-  }
-
-  isIncludeAndNotExclude(file) {
-    var isExclude,
-        isInclude,
-        {include, exclude} = this.options
-
-    isInclude = include ? testRule(include, file) : true
-    isExclude = exclude ? testRule(exclude, file) : false
-
-    return isInclude && !isExclude
-  }
-
-  connect() {
-    if (this.isConnected) return
-
-    this.client = new S3(this.clientConfig.s3Options)
-    this.isConnected = true
-  }
-
-  transformBasePath() {
-    return Promise.resolve(this.basePathTransform(this.options.basePath))
-      .then(addTrailingS3Sep)
-      .then((nPath) => (this.options.basePath = nPath))
-  }
-
-  setupProgressBar(uploadFiles) {
-    const progressTotal = uploadFiles.reduce((acc, {upload}) => upload.totalBytes + acc, 0)
-
-    const progressBar = new ProgressBar('Uploading [:bar] :percent :etas', {
-      complete: '>',
-      incomplete: '∆',
-      total: progressTotal,
-    })
-
-    var progressValue = 0
-
-    uploadFiles.forEach(({upload}) => {
-      upload.on('httpUploadProgress', ({loaded}) => {
-        progressValue += loaded
-
-        progressBar.update(progressValue)
-      })
-    })
-  }
-
-  prioritizeFiles(files) {
-    const remainingFiles = [...files]
-    const prioritizedFiles = this.options.priority.map((reg) =>
-      _.remove(remainingFiles, (file) => reg.test(file.name))
-    )
-
-    return [remainingFiles, ...prioritizedFiles]
-  }
-
-  uploadPriorityChunk(priorityChunk) {
-    const uploadFiles = priorityChunk.map((file) =>
-      this.uploadFile(file.name, file.path)
-    )
-
-    return Promise.all(uploadFiles.map(({promise}) => promise))
-  }
-
-  uploadInPriorityOrder(files) {
-    const priorityChunks = this.prioritizeFiles(files)
-    const uploadFunctions = priorityChunks.map((priorityChunk) => () =>
-      this.uploadPriorityChunk(priorityChunk)
-    )
-
-    return uploadFunctions.reduce(
-      (promise, uploadFn) => promise.then(uploadFn),
-      Promise.resolve()
-    )
-  }
-
-  uploadFiles(files = []) {
-    return this.transformBasePath().then(() => {
-      if (this.options.priority) {
-        return this.uploadInPriorityOrder(files)
-      } else {
-        const uploadFiles = files.map((file) =>
-          this.uploadFile(file.name, file.path)
-        )
-
-        if (this.options.progress) {
-          this.setupProgressBar(uploadFiles)
-        }
-
-        return Promise.all(uploadFiles.map(({promise}) => promise))
-      }
-    })
-  }
-
-  uploadFile(fileName, file) {
-    let Key = this.options.basePath + fileName
-    const s3Params = _.mapValues(this.uploadOptions, (optionConfig) => {
-      return _.isFunction(optionConfig) ? optionConfig(fileName, file) : optionConfig
-    })
-
-    // avoid noname folders in bucket
-    if (Key[0] === '/') Key = Key.substr(1)
-
-    if (s3Params.ContentType === undefined)
-      s3Params.ContentType = mime.getType(fileName)
-
-    const Body = fs.createReadStream(file)
-    const upload = this.client.upload(
-      _.merge({Key, Body}, DEFAULT_UPLOAD_OPTIONS, s3Params)
-    )
-
-    if (!this.noCdnizer) this.cdnizerOptions.files.push(`*${fileName}*`)
-
-    return {upload, promise: upload.promise()}
-  }
-
-  invalidateCloudfront() {
-    const {clientConfig, cloudfrontInvalidateOptions} = this
-
-    if (cloudfrontInvalidateOptions.DistributionId) {
-      const {
-        accessKeyId,
-        secretAccessKey,
-        sessionToken,
-      } = clientConfig.s3Options
-      const cloudfront = new CloudFront({
-        accessKeyId,
-        secretAccessKey,
-        sessionToken,
-      })
-
-      if (!_.isArray(cloudfrontInvalidateOptions.DistributionId))
-        cloudfrontInvalidateOptions.DistributionId = [
-          cloudfrontInvalidateOptions.DistributionId
-        ]
-
-      const cloudfrontInvalidations = cloudfrontInvalidateOptions.DistributionId.map(
-        (DistributionId) =>
-          new Promise((resolve, reject) => {
-            cloudfront.createInvalidation({
-              DistributionId,
-              InvalidationBatch: {
-                CallerReference: Date.now().toString(),
-                Paths: {
-                  Quantity: cloudfrontInvalidateOptions.Items.length,
-                  Items: cloudfrontInvalidateOptions.Items,
-                },
-              },
-            }, (err, res) => {
-              if (err) reject(err)
-              else resolve(res.Id)
-            })
-          })
-      )
-
-      return Promise.all(cloudfrontInvalidations)
-    } else {
-      return Promise.resolve(null)
-    }
   }
 }

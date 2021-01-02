@@ -1,4 +1,10 @@
 # Created by https://www.gitignore.io
+/lib
+/.tests
+*.zip
+
+yarn.lock
+*.tsbuildinfo
 
 ### Node ###
 # Logs
