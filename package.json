@@ -4,15 +4,16 @@
   "description": "Uploads compiled assets to s3 after build",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:watch": "yarn build -w",
     "prepublishOnly": "yarn run lint && yarn run test && yarn run build",
-    "test": "NODE_ENV='src/test' jest -t 10000 --require @babel/register",
-    "lint": "eslint ./src src/test",
-    "prep:major": "yarn run build && yarn version major",
-    "prep:minor": "yarn run build && yarn version minor",
-    "prep:patch": "yarn run build && yarn version patch"
+    "test": "jest",
+    "release": "yarn publish --non-interactive",
+    "release:patch": "yarn release --patch"
   },
   "repository": {
     "type": "git",
