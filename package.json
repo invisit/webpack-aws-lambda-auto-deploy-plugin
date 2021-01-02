@@ -16,21 +16,25 @@
   },
   "repository": {
     "type": "git",
-    "url": "git@github.com:webpack-contrib/s3-plugin-webpack.git"
+    "url": "git@github.com:invisit/webpack-aws-lambda-auto-deploy-plugin.git"
   },
   "keywords": [
+    "autodeploy",
+    "deploy",
+    "aws",
+    "lambda",
     "s3",
     "webpack",
     "node",
     "upload",
     "production"
   ],
-  "author": "Mika Kalathil",
+  "author": "Jonathan Glanz",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/webpack-contrib/s3-plugin-webpack/issues"
+    "url": "https://github.com/invisit/webpack-aws-lambda-auto-deploy-plugin/issues"
   },
-  "homepage": "https://github.com/webpack-contrib/s3-plugin-webpack",
+  "homepage": "https://github.com/invisit/webpack-aws-lambda-auto-deploy-plugin",
   "dependencies": {
     "@3fv/deferred": "^1.2.1",
     "@3fv/guard": "^1.4.18",
@@ -38,7 +42,6 @@
     "archiver": "^5.1.0",
     "aws-sdk": "^2.819.0",
     "lodash": "^4.17.20",
-    "mime": "^2.4.7",
     "moment": "^2.29.1",
     "p-queue": "^6.6.2",
     "shelljs": "^0.8.4",

@@ -1,7 +1,11 @@
-export type {AWSLambdaAutoDeployPluginConfig, EntryLambdaMapping, AutoDeployStorage, AWSDeployConfig} from "./types"
+export type {
+  AWSLambdaAutoDeployPluginConfig,
+  EntryLambdaMapping,
+  DefaultEntryName,
+  AutoDeployStorage,
+  AWSDeployConfig
+} from "./types"
 import AWSLambdaAutoDeployPlugin from "./AWSLambdaAutoDeployPlugin"
 
 
-
-//module.exports
 export default AWSLambdaAutoDeployPlugin
