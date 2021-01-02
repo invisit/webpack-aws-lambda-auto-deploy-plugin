@@ -1,0 +1,11 @@
+{
+  "babel": false,
+  "ts": {
+    "path": "./node_modules/typescript",
+    "compilerOptions": {
+      "module": "CommonJS"
+    }
+  },
+  "autoDetect": false
+  
+}
