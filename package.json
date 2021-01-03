@@ -1,6 +1,6 @@
 {
   "name": "@invisit/webpack-aws-lambda-auto-deploy-plugin",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Uploads compiled assets to s3 after build",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
