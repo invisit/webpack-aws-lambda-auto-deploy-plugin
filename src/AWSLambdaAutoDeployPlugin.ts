@@ -3,7 +3,7 @@ import { uniq } from "lodash"
 import * as AWS from "aws-sdk"
 import type { PackageJson } from "types-package-json"
 import Archiver from "archiver"
-import Webpack, { compilation } from "webpack"
+import Webpack, { Plugin, compilation } from "webpack"
 import * as Sh from "shelljs"
 import {
   getFileTimestamp,
@@ -12,6 +12,7 @@ import {
   RootPluginDir
 } from "./helpers"
 import {
+  AutoDeployStorage,
   AWSDeployStorageConfig,
   AWSLambdaAutoDeployPluginConfig,
   DefaultEntryName,
@@ -35,7 +36,7 @@ type AutoDeployArgs = [
   EntryLambdaMapping
 ]
 
-export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
+export default class AWSLambdaAutoDeployPlugin<Storage extends AutoDeployStorage = any> {
   readonly pkg: PackageJson = require(Path.join(RootPluginDir, "package.json"))
 
   readonly name: string = this.pkg.name
@@ -154,13 +155,15 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
           ({
             type: "lambda"
           } as AWSDeployStorageConfig<any>)
-
+    
+      const zipFileBuf = await Fs.promises.readFile(archiveFile)
+      log.info(`Using bundle of size: ${zipFileBuf.length}`)
       if (storageConfig.type === "s3") {
         const s3StorageConfig = storageConfig as AWSDeployStorageConfig<"s3">
         const { bucket, pathPrefix = "", namePrefix = "" } = s3StorageConfig
 
         const path = pathPrefix.replace(/^\//, "").replace(/\/$/, ""),
-          isValidPath = path.length === 0,
+          isValidPath = path.length > 0,
           key = `${isValidPath ? path + "/" : ""}${namePrefix}${entry}.zip`
 
         await this.s3
@@ -168,7 +171,7 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
             Bucket: bucket,
             Key: key,
             ContentType: "application/zip",
-            Body: Fs.createReadStream(archiveFile)
+            Body: zipFileBuf
           })
           .promise()
 
@@ -184,12 +187,13 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
           )
         )
       } else {
+        
         await Promise.all(
           fn.map(async fn =>
             this.lambda
               .updateFunctionCode({
                 FunctionName: fn,
-                ZipFile: Fs.createReadStream(archiveFile)
+                ZipFile: zipFileBuf
               })
               .promise()
           )
@@ -214,6 +218,12 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
     const allStats: Array<Webpack.Stats> = isMultiStats(statsOrMultiStats)
       ? statsOrMultiStats.stats
       : [statsOrMultiStats]
+    
+    if (allStats.some(it => it.hasErrors())) {
+      log.warn(`Build contains errors, skipping deploy`)
+      return
+    }
+    
     const pendingDeployments = uniq(
       allStats
         .map(({ compilation }) => [
@@ -268,7 +278,7 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
   }
 
   constructor(
-    public config: AWSLambdaAutoDeployPluginConfig,
+    public config: AWSLambdaAutoDeployPluginConfig<Storage>,
     public readonly awsConfig: Partial<AWS.Config> = config.aws?.config ?? {},
     public readonly entryMap: Record<string, EntryLambdaMapping> = asOption(
       config.mappings
@@ -296,9 +306,12 @@ export default class AWSLambdaAutoDeployPlugin implements Webpack.Plugin {
         }),
         {} as Record<string, EntryLambdaMapping>
       )
-  ) {}
+  ) {
+  
+  }
 
-  apply(compiler: Webpack.Compiler) {
+  apply(anyCompiler: Webpack.Compiler) {
+    const compiler = anyCompiler as Webpack.Compiler
     compiler.hooks.done.tapPromise(this.name, this.onDone)
   }
 

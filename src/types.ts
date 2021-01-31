@@ -39,7 +39,7 @@ export type AWSDeployConfig<Storage extends AutoDeployStorage> =
   }
   
 
-export type AWSLambdaAutoDeployPluginConfig<Storage extends AutoDeployStorage = "lambda"> =  {
+export type AWSLambdaAutoDeployPluginConfig<Storage extends AutoDeployStorage = any> =  {
   aws?: AWSDeployConfig<Storage>
   /**
    * If you simply provider the function name and not
