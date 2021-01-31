@@ -7,7 +7,6 @@ const log = Tracer.colorConsole({
   rootDir: Path.resolve(__dirname, "..")
 })
 
-
 export const RootPluginDir = Path.resolve(__dirname, "..")
 
 export function getFileTimestamp() {

@@ -19,7 +19,6 @@ import {
 } from "./types"
 import { asOption } from "@3fv/prelude-ts"
 import * as Fs from "fs"
-import moment from "moment"
 import { Deferred } from "@3fv/deferred"
 
 const log = getLogger()
